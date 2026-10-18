@@ -89,6 +89,7 @@ deployments continue unchanged and the operator commands are ignored.
 ```bash
 cp .env.example .env     # then fill in BOT_TOKEN and TELEGRAM_CHAT_ID
 npm install
+npm run doctor           # verify environment and .env configuration
 npm run dev              # tsx, restarts on change
 ```
 
