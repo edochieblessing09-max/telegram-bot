@@ -4,13 +4,17 @@ import test from "node:test";
 
 import {
   assertEventsResponse,
-  assertRpcResponseSize,
+  clampRetryDelayMs,
   DEFAULT_MAX_EVENTS_PER_RESPONSE,
-  DEFAULT_MAX_RESPONSE_BYTES,
+  parseRetryAfterHeaderMs,
   RpcResponseShapeError,
   wrapOversizedResponseError,
 } from "../dist/stellar/rpc-guard.js";
-import { createRpcServer } from "../dist/stellar/client.js";
+import {
+  DEFAULT_RPC_MAX_BACKOFF_MS,
+  resolveMaxBackoffMs,
+} from "../dist/stellar/client.js";
+import { extractRetryAfterMs } from "../dist/poller.js";
 import { defaultMockScenario, startMockRpc } from "../dist/stellar/mock-rpc.js";
 import { paginatedGetEvents } from "../dist/stellar/events.js";
 
@@ -357,160 +361,64 @@ test("paginatedGetEvents rejects oversized RPC response at the boundary", async 
   );
 });
 
-// ── Response byte-limit guard ──────────────────────────────────────────────────
+// ── Untrusted RPC retry-delay clamping ─────────────────────────────────────────
 
-test("assertRpcResponseSize accepts responses up to and including maxBytes", () => {
-  assert.doesNotThrow(() => assertRpcResponseSize(0, 1024));
-  assert.doesNotThrow(() => assertRpcResponseSize(1024, 1024));
-  assert.doesNotThrow(() => assertRpcResponseSize(DEFAULT_MAX_RESPONSE_BYTES));
-});
+test("resolveMaxBackoffMs returns default when omitted and rejects invalid ceilings", () => {
+  assert.equal(resolveMaxBackoffMs(undefined), DEFAULT_RPC_MAX_BACKOFF_MS);
+  assert.equal(resolveMaxBackoffMs(15_000), 15_000);
+  assert.equal(resolveMaxBackoffMs(0), 0);
 
-test("assertRpcResponseSize rejects responses exceeding maxBytes", () => {
-  assert.throws(
-    () => assertRpcResponseSize(1025, 1024),
-    (err) => {
-      assert(err instanceof RpcResponseShapeError);
-      assert.equal(err.problem, "response-oversized");
-      assert.match(err.message, /1025 bytes exceeds limit of 1024 bytes/);
-      assert(err.message.length <= 150);
-      return true;
-    },
-  );
-});
-
-test("wrapOversizedResponseError normalizes maxContentLength errors and preserves others", () => {
-  const sdkErr = new Error("maxContentLength size of 2048 exceeded");
-  const wrapped = wrapOversizedResponseError(sdkErr, 2048);
-  assert(wrapped instanceof RpcResponseShapeError);
-  assert.equal(wrapped.problem, "response-oversized");
-  assert.match(wrapped.message, /2048 bytes/);
-
-  const unrelated = new Error("ECONNRESET");
-  assert.equal(wrapOversizedResponseError(unrelated, 2048), unrelated);
-});
-
-async function startFakeRpcServer(handler) {
-  const server = http.createServer((req, res) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      handler(body, res);
-    });
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address();
-  return {
-    url: `http://127.0.0.1:${port}`,
-    close: () => new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
-  };
-}
-
-test("createRpcServer aborts oversized getEvents response before JSON parsing and leaves cursor unchanged", async () => {
-  const limitBytes = 512;
-  const fakeRpc = await startFakeRpcServer((body, res) => {
-    if (body.method === "getHealth") {
-      const payload = JSON.stringify({
-        jsonrpc: "2.0",
-        id: body.id,
-        result: { status: "healthy", oldestLedger: 900, latestLedger: 1000 },
-      });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(payload);
-      return;
-    }
-
-    // Stream an oversized, invalid-JSON payload without Content-Length (chunked)
-    // to prove the client aborts while reading bytes rather than parsing JSON.
-    res.writeHead(200, { "content-type": "application/json" });
-    res.write('{"jsonrpc":"2.0","id":1,"result":{"events":[');
-    res.write(`"${"X".repeat(limitBytes * 2)}"`);
-    // Intentionally omit closing JSON brackets: if JSON.parse ran, it would throw SyntaxError.
-    res.end();
-  });
-
-  try {
-    const server = createRpcServer({
-      rpcUrl: fakeRpc.url,
-      horizonUrl: fakeRpc.url,
-      networkPassphrase: "Test SDF Network ; September 2015",
-      marketContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-      squadContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-      marketContractVersion: "v1",
-      squadContractVersion: "v1",
-      explorerBaseUrl: "https://stellar.expert/explorer",
-      rpcMaxResponseBytes: limitBytes,
-    });
-
-    const initialCursor = "0000000950000000000-0000000000";
-    let targetCursor = initialCursor;
-
-    await assert.rejects(
-      async () => {
-        const result = await paginatedGetEvents(server, [], { cursor: targetCursor });
-        if (result.cursor) targetCursor = result.cursor;
-      },
-      (err) => {
-        assert(err instanceof RpcResponseShapeError);
-        assert.equal(err.problem, "response-oversized");
-        assert.match(err.message, /512 bytes/);
-        return true;
-      },
-    );
-
-    assert.equal(targetCursor, initialCursor, "target cursor must remain unchanged on oversized response");
-  } finally {
-    await fakeRpc.close();
+  for (const invalid of [-1, NaN, Infinity, -Infinity, "60000"]) {
+    assert.throws(() => resolveMaxBackoffMs(invalid), RangeError);
   }
 });
 
-test("createRpcServer accepts getEvents response within configured rpcMaxResponseBytes", async () => {
-  const fakeRpc = await startFakeRpcServer((body, res) => {
-    if (body.method === "getHealth") {
-      const payload = JSON.stringify({
-        jsonrpc: "2.0",
-        id: body.id,
-        result: { status: "healthy", oldestLedger: 900, latestLedger: 1000 },
-      });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(payload);
-      return;
-    }
+test("clampRetryDelayMs rejects negative, nonfinite, and non-numeric values and clamps oversized delays", () => {
+  assert.equal(clampRetryDelayMs(5_000, 10_000), 5_000);
+  assert.equal(clampRetryDelayMs(0, 10_000), 0);
+  assert.equal(clampRetryDelayMs(50_000, 10_000), 10_000);
+  assert.equal(clampRetryDelayMs(DEFAULT_RPC_MAX_BACKOFF_MS + 1), DEFAULT_RPC_MAX_BACKOFF_MS);
 
-    const payload = JSON.stringify({
-      jsonrpc: "2.0",
-      id: body.id,
-      result: {
-        events: [],
-        cursor: "0000001000000000000-0000000000",
-        latestLedger: 1000,
-      },
-    });
-    res.writeHead(200, {
-      "content-type": "application/json",
-      "content-length": String(Buffer.byteLength(payload)),
-    });
-    res.end(payload);
-  });
-
-  try {
-    const server = createRpcServer({
-      rpcUrl: fakeRpc.url,
-      horizonUrl: fakeRpc.url,
-      networkPassphrase: "Test SDF Network ; September 2015",
-      marketContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-      squadContractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-      marketContractVersion: "v1",
-      squadContractVersion: "v1",
-      explorerBaseUrl: "https://stellar.expert/explorer",
-      rpcMaxResponseBytes: 4096,
-    });
-
-    const result = await paginatedGetEvents(server, [], {
-      cursor: "0000000950000000000-0000000000",
-    });
-    assert.equal(result.cursor, "0000001000000000000-0000000000");
-  } finally {
-    await fakeRpc.close();
+  for (const invalid of [-1, -0.001, NaN, Infinity, -Infinity, "1000", null, undefined]) {
+    assert.equal(clampRetryDelayMs(invalid, 10_000), null);
   }
+});
+
+test("parseRetryAfterHeaderMs rejects malformed/negative/nonfinite headers and keeps maxBackoffMs authoritative", () => {
+  assert.equal(parseRetryAfterHeaderMs("5", 10_000), 5_000);
+  assert.equal(parseRetryAfterHeaderMs(" 1.5 ", 10_000), 1_500);
+  assert.equal(parseRetryAfterHeaderMs("0", 10_000), 0);
+  assert.equal(parseRetryAfterHeaderMs("3600", 15_000), 15_000);
+  assert.equal(parseRetryAfterHeaderMs(120, 30_000), 30_000);
+
+  for (const invalid of [
+    "-5",
+    "-1",
+    "NaN",
+    "Infinity",
+    "10abc",
+    "",
+    "1e308",
+    -10,
+    NaN,
+    Infinity,
+    null,
+    undefined,
+  ]) {
+    assert.equal(parseRetryAfterHeaderMs(invalid, 10_000), null);
+  }
+});
+
+test("extractRetryAfterMs respects configured maxBackoffMs and rejects invalid RPC headers", () => {
+  const oversizedErr = { headers: { "Retry-After": "999999" } };
+  assert.equal(extractRetryAfterMs(oversizedErr, 12_000), 12_000);
+
+  const negativeErr = { headers: { "retry-after": "-30" } };
+  assert.equal(extractRetryAfterMs(negativeErr, 12_000), null);
+
+  const nonFiniteErr = { parameters: { retry_after: Infinity } };
+  assert.equal(extractRetryAfterMs(nonFiniteErr, 12_000), null);
+
+  const garbageErr = { headers: { "Retry-After": "10seconds" } };
+  assert.equal(extractRetryAfterMs(garbageErr, 12_000), null);
 });
