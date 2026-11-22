@@ -8,17 +8,78 @@
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import { resolveMaxBackoffMs } from "./client.js";
+
 /** Default ceiling on the number of events permitted in a single RPC response. */
 export const DEFAULT_MAX_EVENTS_PER_RESPONSE = 1_000;
 
+export type RpcNetworkIdentityProblem =
+  | "not-an-object"
+  | "malformed-passphrase"
+  | "passphrase-mismatch";
+
 /**
- * Default bounded interval (in milliseconds) over which a provider's
- * `latestLedger` must advance before it is flagged as stale.
+ * Error thrown when an RPC endpoint's `getNetwork` response fails network
+ * identity validation.
  *
- * Stellar closes a ledger roughly every 5 seconds, so 60 seconds corresponds
- * to ~12 missed ledger closes.
+ * Messages are strictly bounded and never echo configured or reported
+ * passphrases.
  */
-export const DEFAULT_MAX_LEDGER_STALL_MS = 60_000;
+export class RpcNetworkIdentityError extends Error {
+  readonly problem: RpcNetworkIdentityProblem;
+
+  constructor(problem: RpcNetworkIdentityProblem, message: string) {
+    super(message);
+    this.name = "RpcNetworkIdentityError";
+    this.problem = problem;
+  }
+}
+
+export interface VerifiedNetworkIdentity {
+  passphrase: string;
+}
+
+/**
+ * Validate a `getNetwork` RPC response against the configured network passphrase.
+ *
+ * Rejects non-object payloads, missing or non-string passphrases, and endpoints
+ * reporting a different network passphrase than configured. Error messages are
+ * bounded and never echo the raw passphrases.
+ *
+ * @param value The raw `getNetwork` response value to validate.
+ * @param expectedPassphrase The configured Stellar network passphrase.
+ * @returns The verified network identity.
+ * @throws {RpcNetworkIdentityError} When the response is malformed or serves another network.
+ */
+export function assertNetworkIdentity(
+  value: unknown,
+  expectedPassphrase: string,
+): VerifiedNetworkIdentity {
+  if (!isRecord(value)) {
+    throw new RpcNetworkIdentityError(
+      "not-an-object",
+      `RPC getNetwork response must be an object; got ${value === null ? "null" : typeof value}`,
+    );
+  }
+
+  const rpcPassphrase = value.passphrase;
+  if (typeof rpcPassphrase !== "string") {
+    throw new RpcNetworkIdentityError(
+      "malformed-passphrase",
+      `RPC getNetwork returned a malformed passphrase (expected a string; got ${typeof rpcPassphrase})`,
+    );
+  }
+
+  if (rpcPassphrase !== expectedPassphrase) {
+    throw new RpcNetworkIdentityError(
+      "passphrase-mismatch",
+      `RPC network passphrase does not match the configured value ` +
+        `(configured=${expectedPassphrase.length} chars, received=${rpcPassphrase.length} chars)`,
+    );
+  }
+
+  return { passphrase: rpcPassphrase };
+}
 
 export type RpcGuardProblem =
   | "not-an-object"
@@ -149,187 +210,63 @@ export function assertEventsResponse(
   return value as unknown as rpc.Api.GetEventsResponse;
 }
 
-// ── Provider ledger-progress tracking ────────────────────────────────────────
+// ── Untrusted RPC retry-delay clamping ───────────────────────────────────────
 
 /**
- * Classification of an RPC provider's liveness based on ledger progression
- * over a bounded interval, independent of whether contract events were emitted:
+ * Clamp a numeric retry delay (in milliseconds) against the configured
+ * authoritative maximum backoff.
  *
- * - `"active"`: provider is up-to-date (ledger advancing or within the bounded
- *   interval) and events were observed in the latest sample.
- * - `"idle"`: provider is up-to-date, and no events were observed in the latest
- *   sample. An idle event stream is healthy and must not be flagged as stale.
- * - `"stale-provider"`: provider's `latestLedger` failed to advance across the
- *   configured `maxStaleMs` interval.
+ * Rejects negative, non-finite (`NaN`, `Infinity`, `-Infinity`), and
+ * non-numeric values by returning `null`, and clamps oversized finite values to
+ * `resolveMaxBackoffMs(maxBackoffMs)`.
  */
-export type ProviderLivenessStatus = "active" | "idle" | "stale-provider";
-
-export interface LedgerProgressSample {
-  /** Chain tip (`latestLedger`) reported by the RPC provider. */
-  latestLedger: number;
-  /** Number of events returned in the poll (defaults to `0`). */
-  eventsCount?: number | undefined;
-  /** Wall-clock timestamp in ms for this observation (defaults to `now()`). */
-  observedAtMs?: number | undefined;
-}
-
-export interface LedgerProgressReport {
-  /** High-level classification differentiating stale providers from idle streams. */
-  status: ProviderLivenessStatus;
-  /** True only when `latestLedger` has not advanced for at least `maxStaleMs`. */
-  stale: boolean;
-  /** True when the latest sample contained zero events (`eventsCount === 0`). */
-  idle: boolean;
-  /** True when `latestLedger` moved backwards relative to the highest seen ledger. */
-  regressed: boolean;
-  /** The `latestLedger` value from the current observation. */
-  latestLedger: number;
-  /** Highest `latestLedger` observed so far (anchor for staleness timing). */
-  baselineLedger: number;
-  /** Difference `latestLedger - previousBaselineLedger` (negative on regression). */
-  ledgerDelta: number;
-  /** Elapsed milliseconds since `baselineLedger` was first observed without advancing. */
-  stalledMs: number;
-  /** Configured staleness threshold in milliseconds. */
-  maxStaleMs: number;
-}
-
-export interface LedgerProgressTrackerOptions {
-  /**
-   * Bounded interval in milliseconds over which `latestLedger` must advance
-   * before the provider is classified as `"stale-provider"`.
-   * Must be a positive finite number. Defaults to {@link DEFAULT_MAX_LEDGER_STALL_MS}.
-   */
-  maxStaleMs?: number | undefined;
-  /** Clock source returning current epoch milliseconds. Defaults to `Date.now`. */
-  now?: (() => number) | undefined;
+export function clampRetryDelayMs(
+  delayMs: unknown,
+  maxBackoffMs?: number,
+): number | null {
+  const authoritativeMax = resolveMaxBackoffMs(maxBackoffMs);
+  if (typeof delayMs !== "number" || !Number.isFinite(delayMs) || delayMs < 0) {
+    return null;
+  }
+  return Math.min(delayMs, authoritativeMax);
 }
 
 /**
- * Tracks a Soroban RPC provider's `latestLedger` progress over a bounded
- * interval to differentiate a stale/stuck provider from an idle event stream.
+ * Parse and clamp a `Retry-After` header value (in seconds) from an untrusted
+ * RPC response against the configured maximum backoff.
  *
- * A provider that continues advancing `latestLedger` while returning zero
- * events is classified as `"idle"` (`stale: false`), never `"stale-provider"`.
- * Only when `latestLedger` fails to advance for at least `maxStaleMs` is the
- * provider flagged as `"stale-provider"` (`stale: true`).
+ * Rejects negative, non-finite, empty, or trailing-garbage values (e.g.
+ * `"-5"`, `"NaN"`, `"Infinity"`, `"10abc"`), rejects overflow to `Infinity`
+ * when converting seconds to milliseconds, and clamps oversized delays to
+ * `resolveMaxBackoffMs(maxBackoffMs)`.
  */
-export class LedgerProgressTracker {
-  private readonly maxStaleMs: number;
-  private readonly now: () => number;
-  private baselineLedger: number | null = null;
-  private baselineObservedAtMs: number | null = null;
-  private lastReport: LedgerProgressReport | null = null;
+export function parseRetryAfterHeaderMs(
+  headerValue: unknown,
+  maxBackoffMs?: number,
+): number | null {
+  const authoritativeMax = resolveMaxBackoffMs(maxBackoffMs);
 
-  constructor(options: LedgerProgressTrackerOptions = {}) {
-    const maxStaleMs = options.maxStaleMs ?? DEFAULT_MAX_LEDGER_STALL_MS;
-    if (typeof maxStaleMs !== "number" || !Number.isFinite(maxStaleMs) || maxStaleMs <= 0) {
-      throw new RangeError(
-        `LedgerProgressTracker maxStaleMs must be a positive finite number; got ${String(maxStaleMs)}`,
-      );
+  let seconds: number;
+  if (typeof headerValue === "number") {
+    seconds = headerValue;
+  } else if (typeof headerValue === "string") {
+    const trimmed = headerValue.trim();
+    if (!/^\d+(?:\.\d+)?$/.test(trimmed)) {
+      return null;
     }
-    this.maxStaleMs = maxStaleMs;
-    this.now = options.now ?? Date.now;
+    seconds = Number(trimmed);
+  } else {
+    return null;
   }
 
-  /**
-   * Record a new RPC observation and return the updated liveness report.
-   *
-   * @throws {RpcResponseShapeError} If `latestLedger` is not a valid non-negative integer.
-   */
-  observe(sample: LedgerProgressSample): LedgerProgressReport {
-    if (!isValidLedger(sample?.latestLedger)) {
-      throw new RpcResponseShapeError(
-        "latest-ledger-invalid",
-        `RPC provider "latestLedger" must be a valid non-negative integer; got ${typeof sample?.latestLedger}`,
-      );
-    }
-
-    const latestLedger = sample.latestLedger;
-    const eventsCount = sample.eventsCount ?? 0;
-    const idle = eventsCount === 0;
-    const observedAtMs = sample.observedAtMs ?? this.now();
-
-    if (typeof observedAtMs !== "number" || !Number.isFinite(observedAtMs)) {
-      throw new RangeError(
-        `LedgerProgressTracker observedAtMs must be a finite number; got ${String(observedAtMs)}`,
-      );
-    }
-
-    if (this.baselineLedger === null || this.baselineObservedAtMs === null) {
-      this.baselineLedger = latestLedger;
-      this.baselineObservedAtMs = observedAtMs;
-      const report: LedgerProgressReport = {
-        status: idle ? "idle" : "active",
-        stale: false,
-        idle,
-        regressed: false,
-        latestLedger,
-        baselineLedger: latestLedger,
-        ledgerDelta: 0,
-        stalledMs: 0,
-        maxStaleMs: this.maxStaleMs,
-      };
-      this.lastReport = report;
-      return report;
-    }
-
-    const previousBaseline = this.baselineLedger;
-    const ledgerDelta = latestLedger - previousBaseline;
-
-    if (ledgerDelta > 0) {
-      // Provider advanced: reset stall timer even if the event stream is idle.
-      this.baselineLedger = latestLedger;
-      this.baselineObservedAtMs = observedAtMs;
-      const report: LedgerProgressReport = {
-        status: idle ? "idle" : "active",
-        stale: false,
-        idle,
-        regressed: false,
-        latestLedger,
-        baselineLedger: latestLedger,
-        ledgerDelta,
-        stalledMs: 0,
-        maxStaleMs: this.maxStaleMs,
-      };
-      this.lastReport = report;
-      return report;
-    }
-
-    // No forward progress (stalled or regressed): keep highest baseline and anchor time.
-    const stalledMs = Math.max(0, observedAtMs - this.baselineObservedAtMs);
-    const stale = stalledMs >= this.maxStaleMs;
-    const regressed = ledgerDelta < 0;
-    const status: ProviderLivenessStatus = stale
-      ? "stale-provider"
-      : idle
-        ? "idle"
-        : "active";
-
-    const report: LedgerProgressReport = {
-      status,
-      stale,
-      idle,
-      regressed,
-      latestLedger,
-      baselineLedger: previousBaseline,
-      ledgerDelta,
-      stalledMs,
-      maxStaleMs: this.maxStaleMs,
-    };
-    this.lastReport = report;
-    return report;
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return null;
   }
 
-  /** Return the most recent liveness report, or `null` if no sample has been observed. */
-  snapshot(): LedgerProgressReport | null {
-    return this.lastReport;
+  const delayMs = seconds * 1000;
+  if (!Number.isFinite(delayMs)) {
+    return null;
   }
 
-  /** Clear tracked baseline state (e.g. after switching RPC endpoints). */
-  reset(): void {
-    this.baselineLedger = null;
-    this.baselineObservedAtMs = null;
-    this.lastReport = null;
-  }
+  return Math.min(delayMs, authoritativeMax);
 }
