@@ -113,14 +113,20 @@ import {
   isAdminPayload,
   normalizeContractVersion,
   toAdminAuditRecord,
+  isContractVersionSupported,
+  validateDecoderCombinations,
+  getDecoderCapabilityReport,
   type ContractSource,
   type DecodedEvent,
+  type DecoderCapabilityReport,
 } from "./stellar/decode.js";
 
 export interface TargetState {
   source: ContractSource;
   contractId: string;
   version: string;
+  /** Whether the configured contract version is supported by the decoder subsystem. */
+  supportedVersion?: boolean;
   /** Duration of this target's most recent attempted fetch-decode-send cycle. */
   lastCycleMs: number;
   /** Longest attempted cycle for this target since process start. */
@@ -1686,6 +1692,7 @@ export function createPoller(deps: PollerDeps) {
         source: t.source,
         contractId: t.contractId,
         version: normalizeContractVersion(t.version),
+        supportedVersion: isContractVersionSupported(t.source, t.version),
         lastCycleMs: 0,
         maxCycleMs: 0,
         cursor: null,
@@ -1807,6 +1814,12 @@ export function createPoller(deps: PollerDeps) {
     pendingFlush: false,
     lastFlushAt: null,
     suppressedLogs: 0,
+    unsupportedVersions: validateDecoderCombinations(targets).map((f) => ({
+      source: f.source,
+      version: f.version ?? "",
+      fallback: f.fallbackVersion,
+      reason: f.reason,
+    })),
     targets: [],
     sbomDigest: null,
     circuitBreaker: {
@@ -3356,6 +3369,24 @@ export function createPoller(deps: PollerDeps) {
           pollIntervalMs: config.pollIntervalMs,
         },
       );
+      // Flag unsupported contract version combinations before live polling begins.
+      const unsupported = validateDecoderCombinations(targets);
+      for (const flag of unsupported) {
+        Logger.warn(
+          "poller",
+          `[poller] unsupported contract version combination: source=${flag.source} version=${flag.version} fallback=${flag.fallbackVersion}; ${flag.reason}`,
+          {
+            action: "unsupported_contract_version",
+            source: flag.source,
+            version: flag.version,
+            normalizedVersion: flag.normalizedVersion,
+            contractId: flag.contractId,
+            fallbackVersion: flag.fallbackVersion,
+            reason: flag.reason,
+          },
+        );
+      }
+
       await persistStatus();
       await flushAudit();
       void loop();
@@ -3532,6 +3563,11 @@ export function createPoller(deps: PollerDeps) {
     /** Persist buffered audit entries now (used on shutdown). */
     flushAuditFile(): Promise<void> {
       return flushAudit();
+    },
+
+    /** Return decoder capability reports for each configured watch target. */
+    capabilities(): DecoderCapabilityReport[] {
+      return targets.map((t) => getDecoderCapabilityReport(t.source, t.version, t.contractId));
     },
 
     /** Run one polling cycle directly and await its completion. */
